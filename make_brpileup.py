@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 
-#build an artificial sam file of consensus mappings out of split.fa, the regions from the initial alignment, and the coordinates of those regions in the bed file.
-#use N's at any point that's not very certain by whatever metric.
-#IMPORTANT: SCRIPT ASSUMES PHRED + 33 QUALITY ENCODING. WILL BREAK WITH OTHER ENCODINGS.
+"""
+Build an artificial SAM file of consensus mappings from split sequences.
+
+This script takes split sequences, their original alignment regions, and coordinate information
+to generate consensus alignments. It handles quality filtering and can process alignments
+in parallel using multiple threads.
+
+IMPORTANT: Script assumes PHRED + 33 quality encoding. Will break with other encodings.
+"""
 
 import argparse
 import skbio.alignment as skaln
@@ -10,23 +16,42 @@ from multiprocessing import Pool
 import re
 
 def argparser():
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--consensus', help = "Set prefix of output 'sam' file for consensus alignments.")
-    parser.add_argument('-t', '--threads', type = int, help = 'Set number of threads to use. Default 1', default = 1)
-    parser.add_argument('bed', help = 'Path to a bed file containing coordinate information matching the primary fasta file.')
-    parser.add_argument('regions', help = 'Path to a fasta file containing reference alignment regions from the original round of alignment')
-    parser.add_argument('split', help = 'Path to file containing the split sequences (.fa)')
+    parser.add_argument('-c', '--consensus', help="Set prefix of output 'sam' file for consensus alignments.")
+    parser.add_argument('-t', '--threads', type=int, help='Set number of threads to use. Default 1', default=1)
+    parser.add_argument('bed', help='Path to a bed file containing coordinate information matching the primary fasta file.')
+    parser.add_argument('regions', help='Path to a fasta file containing reference alignment regions from the original round of alignment')
+    parser.add_argument('split', help='Path to file containing the split sequences (.fa)')
     args = parser.parse_args()
     return args
 
-def rand_aln_p(bl, sl):
-    #use a probability function that yields the chance that SL will randomly align perfectly to BL as a filter for too-short fragments. 
+def rand_aln_p(bl: int, sl: int) -> float:
+    """
+    Calculate probability of random perfect alignment between sequences.
+    
+    Args:
+        bl: Length of base sequence
+        sl: Length of sequence to align
+        
+    Returns:
+        float: Probability of random perfect alignment
+    """
     if sl < bl:
         return 1-(1-.25**sl)**(bl-sl)
     else:        
         return 1-(1-.25**bl)**(sl-bl)
 
 def phred_code_qual(sym):
+    """
+    Convert between PHRED+33 quality scores and symbols.
+    
+    Args:
+        sym: Quality score symbol (str) or value (int)
+        
+    Returns:
+        Converted quality value or symbol
+    """
     if isinstance(sym, str):
         return ord(sym) - 33
     elif isinstance(sym, int):
@@ -35,7 +60,16 @@ def phred_code_qual(sym):
         print("Error: quality score conversion not understood. Check input")
         raise ValueError
 
-def bedread(bed_path):
+def bedread(bed_path: str) -> dict:
+    """
+    Read BED file and organize entries by read name.
+    
+    Args:
+        bed_path: Path to BED file
+        
+    Returns:
+        dict: Mapping of read names to lists of region tuples (chrom, start, end)
+    """
     bd = {}
     with open(bed_path) as bedf:
         for entry in bedf:
@@ -47,69 +81,123 @@ def bedread(bed_path):
                 bd[read].append(reg)
     return bd
 
-def regionread(region_path):
+def regionread(region_path: str) -> dict:
+    """
+    Read region sequences from FASTA file.
+    
+    Args:
+        region_path: Path to regions FASTA file
+        
+    Returns:
+        dict: Mapping of sequence names to sequences
+    """
     rd = {}
     cur = None
     with open(region_path) as regf:
         for entry in regf:
             if entry[0] == '>':
-                cur = entry.strip()[1:].partition('::')[0] #forwards compatibility.
+                cur = entry.strip()[1:].partition('::')[0]  # forwards compatibility
             else:
                 rd[cur] = entry.strip()
     return rd
 
-def splitread(split_path):
+def splitread(split_path: str) -> dict:
+    """
+    Read split sequences and their quality scores.
+    
+    Args:
+        split_path: Path to split sequences file
+        
+    Returns:
+        dict: Mapping of read names to lists of [sequence, quality] pairs
+    """
     sd = {}
     cur = None
     with open(split_path) as splf:
-
         for entry in splf:
             if entry[0] == '+':
-                continue #useless lines.
+                continue  # Skip quality score identifier lines
             if entry[0] == '@':
                 cur = entry.partition('_')[0][1:]
-                sd[cur] = sd.get(cur, []) #initialize entry.
+                sd[cur] = sd.get(cur, [])  # Initialize entry
                 tmp = []
-            elif len(tmp) == 0: #add the actual sequence.
+            elif len(tmp) == 0:  # Add sequence
                 tmp.append(entry.strip())
-            elif len(tmp) == 1:
+            elif len(tmp) == 1:  # Add quality scores
                 tmp.append(entry.strip())
                 sd[cur].append(tmp)
     return sd
 
-def generate_consensus(region, seqs):
-    region_counts, flag = basecount(region,seqs)
-    #to create the consensus, simply iterate through region counts and indeces.
+def generate_consensus(region: str, seqs: list) -> tuple:
+    """
+    Generate consensus sequence from multiple aligned sequences.
+    
+    Args:
+        region: Reference region sequence
+        seqs: List of [sequence, quality] pairs
+        
+    Returns:
+        tuple: ([consensus sequence, quality string], flag)
+    """
+    region_counts, flag = basecount(region, seqs)
     consensus = []
-    quality = [] #actually just count. makes stratifying easier.
-    for i, bcs in sorted(region_counts.items(), key = lambda x:x[0]):
-        #get the best base in bcs.
-        b,q = best_base(bcs)
+    quality = []  # Actually just count, makes stratifying easier
+    for i, bcs in sorted(region_counts.items(), key=lambda x:x[0]):
+        b, q = best_base(bcs)
         consensus.append(b)
         quality.append(str(q))
     return [''.join(consensus), ''.join(quality)], flag
 
-def best_base(basecounts):
-    #if all are 0, return an N.
+def best_base(basecounts: dict) -> tuple:
+    """
+    Determine consensus base from base counts.
+    
+    Args:
+        basecounts: Dictionary of base counts
+        
+    Returns:
+        tuple: (consensus base, count)
+    """
     if all([c==0 for c in basecounts.values()]):
         return ('N',0)
-    nonz = sorted([(b,c) for b,c in basecounts.items() if c > 0],key = lambda x:x[1], reverse = True)
+    nonz = sorted([(b,c) for b,c in basecounts.items() if c > 0], key=lambda x:x[1], reverse=True)
     if len(nonz) == 1:
         return nonz[0]
     elif len(nonz) > 1:
-        return ('N', nonz[0][1]) #retain depth but don't count as a real change if there's any controversy.
+        return ('N', nonz[0][1])  # Use N if there's any controversy
     else:
-        return ('N',0) 
+        return ('N',0)
 
-def basecount(region, seqs):
+def basecount(region: str, seqs: list) -> tuple:
+    """
+    Count bases at each position across all sequences.
+    
+    Args:
+        region: Reference region sequence
+        seqs: List of [sequence, quality] pairs
+        
+    Returns:
+        tuple: (position->base->count dict, error flag)
+    """
+    # Initialize counts for each position and base
     counts = {i:{b:0 for b in 'ACGT'} for i in range(len(region)+1)}
-    flag = False #flag is a bool representing whether this particular sequence had an issue of any kind. Used to flag sam output.
-    #print("ErrorChecker from basecount in make_brpileup: Number of sequences, lengths of sequences", len(seqs), [len(v[0]) for v in seqs])
+    flag = False  # Track alignment issues
+    
     for seq, qual in seqs:
-        if rand_aln_p(len(region), len(seq)) <= .0001: # effectively disabling filter for testing.
-            seqaln = skaln.StripedSmithWaterman(seq, gap_open_penalty = 5, gap_extend_penalty = 2, match_score = 1, mismatch_score = -3, zero_index = False)
+        # Filter very short sequences
+        if rand_aln_p(len(region), len(seq)) <= .0001:
+            # Align sequence to region
+            seqaln = skaln.StripedSmithWaterman(
+                seq, 
+                gap_open_penalty=5, 
+                gap_extend_penalty=2, 
+                match_score=1, 
+                mismatch_score=-3, 
+                zero_index=False
+            )
             aln = seqaln(region)
-            #if indels in the cigar- e.g. not a simple parse- skip it.
+            
+            # Skip sequences with indels
             if aln['cigar'].count('I') == 0 and aln['cigar'].count('D') == 0:
                 matched = 0
                 for sec in aln['cigar'].split("M"):
@@ -118,62 +206,90 @@ def basecount(region, seqs):
                         matched += int(reg[-1])
             else:
                 flag = True
-                #print('indel in query alignment {}, continuing'.format(aln['cigar']))
                 continue
-            #print("ErrorChecker from basecount in make_brpileup: Length of sequence, length aligned, length of target", len(seq),matched,len(region))
+                
             index = aln['target_begin']
-            if index != -1: #apparently this means no mapping?
+            if index != -1:  # Valid mapping
                 try:
                     rseq = aln.target_sequence[aln.target_begin:aln.target_end_optimal]
                 except:
                     flag = True
-                    continue #if I don't have a target sequence aligned value, I didn't get an alignment and I don't want to contiue.
+                    continue
+                    
                 qseq = aln.query_sequence[aln.query_begin:aln.query_end]
                 qqual = qual[aln.query_begin:aln.query_end]
-                #print('\t'.join([str(v) for v in [len(aln.query_sequence),len(qseq),len(aln.target_sequence),len(rseq),aln.cigar,aln.optimal_alignment_score,aln.optimal_alignment_score/(len(rseq)+1)]]))
-                if aln.optimal_alignment_score / (len(rseq)+1) < .5: #about .8% of the alignments are below this threshold in quality and shouldn't be used.
+                
+                # Filter low quality alignments
+                if aln.optimal_alignment_score / (len(rseq)+1) < .5:
                     flag = True
                     continue
+                    
+                # Count high quality bases
                 for i, rb in enumerate(rseq):
                     assert len(qseq) == len(rseq)
                     try:
                         qb = qseq[i]
-                        if qb in 'ACGT' and phred_code_qual(qqual[i]) > 12: #12 is the cutoff of <5% of being an error, e.g. qscore 13+ == <.05 of being error
+                        if qb in 'ACGT' and phred_code_qual(qqual[i]) > 12:  # Q13+ = <5% error rate
                             counts[index + i + 1][qb] += 1
                     except:
-                        print("Error trying to count alignment to region", region, aln.aligned_target_sequence, aln.query_sequence, aln['cigar'])#, index, i, rb, qb)
+                        print("Error trying to count alignment to region", region, 
+                              aln.aligned_target_sequence, aln.query_sequence, aln['cigar'])
+                        
     return counts, flag
 
-def sam_entry(seqqual, coord, name, flag = False):
-    #build a fake sam consensus entry.
+def sam_entry(seqqual: list, coord: tuple, name: str, flag: bool=False) -> str:
+    """
+    Generate SAM format entry.
+    
+    Args:
+        seqqual: [sequence, quality] pair
+        coord: Coordinate tuple (chrom, start, end)
+        name: Read name
+        flag: Error flag
+        
+    Returns:
+        str: SAM format entry
+    """
     coord = coord[0]
-    if not flag:
-        fv = '0'
-    else:
-        fv = '512' #ones with issues will be flagged as being below alignment quality
-    return name + "\t" + fv + "\t" + coord[0] + '\t' + str(coord[1]) + '\t60\t' + str(len(seqqual[0])) + "M\t*\t0\t0\t" + seqqual[0] + '\t' + seqqual[1]
+    fv = '512' if flag else '0'  # Flag low quality alignments
+    return f"{name}\t{fv}\t{coord[0]}\t{coord[1]}\t60\t{len(seqqual[0])}M\t*\t0\t0\t{seqqual[0]}\t{seqqual[1]}"
 
-def mapper(input_iter):
+def mapper(input_iter: tuple) -> str:
+    """
+    Process single read alignment for parallel execution.
+    
+    Args:
+        input_iter: Tuple of (name, coordinates, region, split sequences)
+        
+    Returns:
+        str: SAM format entry
+    """
     k, coord, reg, splts = input_iter
     cons, flag = generate_consensus(reg, splts) #version of the reference with either Ns for ambiguous/no information or the 
+    #cons = [reg, 'I' * len(reg)]  # Use reference sequence with placeholder quality
+    #flag = False  # Assume no errors
     samstr = sam_entry(cons, coord, k, flag)
     return samstr
 
 def main():
-    #first step is to read all files into similar dictionary objects
-    #each object key is the base read name
-    #values vary by dictionary
+    """Main function to process alignments and generate consensus SAM file."""
     args = argparser()
-    bed_d = bedread(args.bed) #values are [(chro, start, stop)] for bed regions assigned to that name. May be multiple regions.
-    reg_d = regionread(args.regions) #values are straight up just a sequence of ACTG, to act as a base for the local alignment.
-    spl_d = splitread(args.split) #values are all split up short sequences assigned to that read name and their quality scores
+    
+    # Read input files into dictionaries
+    bed_d = bedread(args.bed)  # Read coordinates
+    reg_d = regionread(args.regions)  # Read reference sequences
+    spl_d = splitread(args.split)  # Read split sequences
+    
+    # Process alignments in parallel
     with open(args.consensus, 'w+') as outf:
         with Pool(args.threads) as p:
-            arguments = [(k, bed_d[k], reg_d[k], spl_d[k]) for k in spl_d.keys() if k in reg_d and k in bed_d]
+            arguments = [(k, bed_d[k], reg_d[k], spl_d[k]) 
+                        for k in spl_d.keys() 
+                        if k in reg_d and k in bed_d]
             samstrs = p.imap_unordered(mapper, arguments)
             for s in samstrs:
                 if s != '':
-                    print(s, file = outf)
+                    print(s, file=outf)
 
 if __name__ == "__main__":
     main()

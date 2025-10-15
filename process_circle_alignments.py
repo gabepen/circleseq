@@ -9,21 +9,29 @@ from Bio import pairwise2
 def create_fasta(entry, name):
     '''
     Process a sam alignment back into N fasta entries by splitting based on cigar string.
-    Additionally, if more bases are trimmed than belong to the primary alignment match, an additional split will be performed on the long trimmed section of the length of the primary alignment under the circle assumption.
+    Additionally, if more bases are trimmed than belong to the primary alignment match,
+    an additional split will be performed on the long trimmed section of the length of 
+    the primary alignment under the circle assumption.
     '''
+    # Parse CIGAR string into tuples of (length, operation)
     cigar = re.findall(r'(\d+)(\w)', entry[5])
+    
+    # Create indices for splitting based on CIGAR operations
     indeces = [0] + [int(i[0]) for i in cigar] + [-1]
+    
+    # Split both sequence and quality scores using these indices
     nseqs, nquals = [[entry[v][indeces[i]:indeces[i] + indeces[i+1]]
         for i in range(len(indeces)-1)] 
-        for v in [9,10]]
-    i = 0
+        for v in [9,10]]  # 9=sequence, 10=quality scores in SAM
+    
+    # Create new FASTQ entries for each split segment
     entries = []
-    for seq, qual in zip(nseqs, nquals):
+    for i, (seq, qual) in enumerate(zip(nseqs, nquals)):
         if len(seq) > 0:
             subname = name + '_' + str(i)
             nent = build_fa_entry(subname, seq, qual)
-            i += 1
             entries.append(nent)
+            
     return entries    
 
 def build_fa_entry(name, seq, qual):
@@ -121,21 +129,27 @@ def main():
         with open(args.fasta_pref, 'w+') as outf:
             with open(args.bed_pref, 'w+') as outb:
                 for entry in samf:
-                    if entry[0] != '@': #skip headers
+                    if entry[0] != '@':  # Skip headers
                         spent = entry.strip().split()
-                        #remove entries with flags > 1000, unaligned reads *, hard clipped, deletions and insertions.
-                        badcig = any([k != -1 for k in [spent[5].find(let) for let in 'HID']])
+                        
+                        # Filter problematic alignments
+                        badcig = any([k != -1 for k in [spent[5].find(let) 
+                                   for let in 'HID']])
                         if int(spent[1]) > 1000 or spent[5] == '*' or badcig or int(spent[4]) == 0:
                             continue
+                            
+                        # Handle read naming
                         if spent[0] in seen:
-                            name = spent[0] + '_1' #its the second read primary alignment
+                            name = spent[0] + '_1'  # Second read
                         else:
-                            name = spent[0] + '_0'
+                            name = spent[0] + '_0'  # First read
                             seen.add(spent[0])
-                            #adding additional functionality: now creating a bed file based on the read index areas.
+                            
+                            # Create BED entry for first read only
                             bent = create_bed(spent, args.distance, cstops)
                             print(bent, file = outb)
-                        # for l in create_fasta(additional_split(spent), name):
+                        
+                        # Create FASTQ entries
                         for l in create_fasta(spent, name):
                             print(l, file = outf)
 

@@ -1,13 +1,42 @@
+# Get parameters from command line
+import sys
+
+# Parse command line arguments
+if len(sys.argv) < 3:
+    print("Usage: snakemake --config reference=<reference_name> target_string=<target_string>")
+    sys.exit(1)
+
+# Get config values
+REFERENCE = config.get("reference", "")
+TARGET_STRING = config.get("target_string", "")
+
+if not REFERENCE or not TARGET_STRING:
+    print("Error: Both 'reference' and 'target_string' must be provided in config")
+    print("Usage: snakemake --config reference=<reference_name> target_string=<target_string>")
+    sys.exit(1)
+
+# Automatically discover samples from input directory
+SAMPLES, = glob_wildcards("input/{sample}_R1.fq.gz")
+SAMPLES = [sample for sample in SAMPLES if TARGET_STRING in sample]
+
+if not SAMPLES:
+    print(f"Warning: No samples found containing '{TARGET_STRING}' in input directory")
+    print("Available samples:", [sample for sample, in glob_wildcards("input/{sample}_R1.fq.gz")])
+    sys.exit(1)
+
+print(f"Found {len(SAMPLES)} samples: {SAMPLES}")
+print(f"Using reference: {REFERENCE}")
+
 rule all:
     input:
-        "{sample}_{reference}.png"
+        expand("{sample}_{reference}.png", sample=SAMPLES, reference=REFERENCE)
 rule bwa_map:
     input:
         "input/{sample}_R1.fq.gz",
         "input/{sample}_R2.fq.gz",
-        "references/{reference}.fa"
+        f"references/{REFERENCE}.fa"
     output:
-        temp("{sample}_{reference}_initial_mapping.sam")
+        "{sample}_{reference}_initial_mapping.sam"
     benchmark:
         "{sample}_{reference}_imap_benchmark.tsv"
     threads: 20
@@ -16,10 +45,10 @@ rule bwa_map:
 rule process_circle_alignments:
     input:
         "{sample}_{reference}_initial_mapping.sam",
-        "references/{reference}.fa.fai"
+        f"references/{REFERENCE}.fa.fai"
     output:
-        temp("{sample}_{reference}_split.fa"),
-        temp("{sample}_{reference}_regions.bed")
+        "{sample}_{reference}_split.fa",
+        "{sample}_{reference}_regions.bed"
     benchmark:
         "{sample}_{reference}_process_benchmark.tsv"
     shell:
@@ -27,9 +56,9 @@ rule process_circle_alignments:
 rule makefasta:
     input:
         "{sample}_{reference}_regions.bed",
-        "references/{reference}.fa"
+        f"references/{REFERENCE}.fa"
     output:
-        temp("{sample}_{reference}_reference.fa")
+        "{sample}_{reference}_reference.fa"
     shell:
         "bedtools getfasta -fi {input[1]} -bed {input[0]} -fo {output} -name"
 rule make_brpileup:
@@ -38,23 +67,23 @@ rule make_brpileup:
         "{sample}_{reference}_regions.bed",
         "{sample}_{reference}_reference.fa"
     output:
-        temp("{sample}_{reference}_consensus.sam")
+        "{sample}_{reference}_consensus.sam"
     benchmark:
         "{sample}_{reference}_refpileup_benchmark.tsv"
     threads: 20
     shell:
-        "python3 make_brpileup.py -t {threads} -c {output} {input[1]} {input[2]} {input[0]}"
+        "python3 make_brpileup_noconsensus.py -t {threads} -c {output} {input[1]} {input[2]} {input[0]}"
 rule index:
     input:
-        "references/{reference}.fa"
+        f"references/{REFERENCE}.fa"
     output:
-        "references/{reference}.fa.fai"
+        f"references/{REFERENCE}.fa.fai"
     shell:
-        "samtools faidx references/{wildcards.reference}.fa"
+        f"samtools faidx references/{REFERENCE}.fa"
 rule samprocess:
     input:
         "{sample}_{reference}_consensus.sam",
-        "references/{reference}.fa.fai"
+        f"references/{REFERENCE}.fa.fai"
     output:
         "{sample}_{reference}.sorted.bam"
     shell:
@@ -65,7 +94,7 @@ rule mpileup:
     output:
         "{sample}_{reference}_variants.txt"
     shell:
-        "samtools mpileup -B -f references/{wildcards.reference}.fa {input} > {output}"
+        f"samtools mpileup -B -Q 17 -f references/{REFERENCE}.fa {{input}} > {{output}}"
 rule count_mutations:
     input:
         "{sample}_{reference}_variants.txt"
